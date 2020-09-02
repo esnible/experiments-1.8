@@ -91,9 +91,11 @@ class ProxyPass extends Context {
     // TODO verify this isn't JSON according to the headers
     if (this.httpStatus) {
       // let cluster = this.root_context.getConfiguration();
-      let cluster = "http://example.com/"
+      // let cluster = "http://example.com/"
+      let cluster = "outbound|80||example.com"
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() will request replacement body from " + cluster);
 
+      /*
       let callHeaders: Headers = [];
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created callHeaders");
       // callHeaders.push(new HeaderPair(String.UTF8.encode(":authority"), String.UTF8.encode("example.com")));
@@ -114,6 +116,9 @@ class ProxyPass extends Context {
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created headerPair");
       callHeaders.push(hpMethod);
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() pushed headerPair");
+      */
+
+      let callHeaders = stream_context.headers.request.get_headers()
       // callHeaders.push(new HeaderPair(String.UTF8.encode(":method"), String.UTF8.encode("GET")));
       // TODO httpCall is not returning, it is logging "critical	envoy wasm	wasm log:  at: ~lib/rt/tlsf.ts(580:3)"
       // which is a checkUsedBlock() assert that a memory block is valid, if I use 

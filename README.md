@@ -21,7 +21,7 @@ First, deploy a pod.  This example uses an _httpbin_ pod, with special annotatio
 kubectl apply -f deploy/httpbin.yaml
 ```
 
-To deploy the Wasm compiled above onto that pod pod:
+To deploy the Wasm compiled above onto that httpbin pod:
 
 ``` bash
 ./deploy/update-wasm.sh
@@ -40,6 +40,8 @@ When this is working -- it currently isn't -- we want to see the status 418 and 
 ## Troubleshooting
 
 - Ignore `WARNING AS201: Conversion from type 'usize' to 'u32' will require an explicit cast`; this is some problem with the Solo.io runtime.
+- Use `istioctl pc log <pod> --level wasm:debug` to turn on debug logging.
+  - Turn it off with `istioctl pc log <pod> --level wasm:warning`
 - Use `istioctl proxy-status` and verify httpbin isn't **STALE**.
 - Verify the mount worked using `kubectl exec deployment/httpbin -c istio-proxy -- ls -l /var/local/wasm`
 - Some of the WASM fields in EnvoyFilter are a bit different than in Istio 1.5-1.7.  If you are porting old filters try to make them look like the example here.
