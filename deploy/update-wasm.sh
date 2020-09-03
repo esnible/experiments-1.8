@@ -38,5 +38,5 @@ done
 echo binary is loaded upon "$TARGET"
 
 # STEP 3. Envoy won't reload .wasm if it changes; but it will if the XDS removes and returns
-kubectl delete -f "$FILTERFILE" > /dev/null || true
+kubectl delete -f "$FILTERFILE" > /dev/null 2> /dev/null || true
 kubectl apply -f "$FILTERFILE"

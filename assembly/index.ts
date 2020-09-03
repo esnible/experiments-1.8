@@ -21,6 +21,78 @@ import { RootContext, Context, registerRootContext,
 // TODO REMOVE 418.  It is here for testing.
 var failureStatuses = [402, 403, 404, 500, 501, 502, 503, 504, 418];
 
+// TODO remove
+type char = u8;
+type ptr<T> = usize;
+type size_t = usize;
+type WasmResult = u32;
+class Reference<T> {
+  data: T;
+
+  ptr(): usize {
+    return changetype<usize>(this) + offsetof<Reference<T>>("data");
+  }
+}
+
+function pairsSize(headers: Headers): i32 {
+  let size = 4; // number of headers
+  // for in loop doesn't seem to be supported..
+  for (let i = 0; i < headers.length; i++) {
+    let header = headers[i];
+    size += 8;                   // size of key, size of value
+    size += header.key.byteLength + 1;  // null terminated key
+    size += header.value.byteLength + 1; // null terminated value
+  }
+  return size;
+}
+
+// @ts-ignore: decorator
+@external("env", "proxy_http_call")
+declare function proxy_http_call(uri_ptr: ptr<char>, uri_size: size_t, header_pairs_ptr: ptr<void>, header_pairs_size: size_t, body_ptr: ptr<char>, body_size: size_t, trailer_pairs_ptr: ptr<void>, trailer_pairs_size: size_t, timeout_milliseconds: u32, token_ptr: ptr<u32>): WasmResult;
+
+  function serializeHeaders(headers: Headers): ArrayBuffer {
+    let result = new ArrayBuffer(pairsSize(headers));
+    let sizes = Uint32Array.wrap(result, 0, 1 + 2 * headers.length);
+    sizes[0] = headers.length;
+  
+    // header sizes:
+    let index = 1;
+  
+    // for in loop doesn't seem to be supported..
+    for (let i = 0; i < headers.length; i++) {
+      let header = headers[i];
+      sizes[index] = header.key.byteLength;
+      index++;
+      sizes[index] = header.value.byteLength;
+      index++;
+    }
+  
+    let data = Uint8Array.wrap(result, sizes.byteLength);
+  
+    let currentOffset = 0;
+    // for in loop doesn't seem to be supported..
+    for (let i = 0; i < headers.length; i++) {
+      let header = headers[i];
+      // i'm sure there's a better way to copy, i just don't know what it is :/
+      let wrappedKey = Uint8Array.wrap(header.key);
+      let keyData = data.subarray(currentOffset, currentOffset + wrappedKey.byteLength);
+      for (let i = 0; i < wrappedKey.byteLength; i++) {
+        keyData[i] = wrappedKey[i];
+      }
+      currentOffset += wrappedKey.byteLength + 1; // + 1 for terminating nil
+  
+      let wrappedValue = Uint8Array.wrap(header.value);
+      let valueData = data.subarray(currentOffset, currentOffset + wrappedValue.byteLength);
+      for (let i = 0; i < wrappedValue.byteLength; i++) {
+        valueData[i] = wrappedValue[i];
+      }
+      currentOffset += wrappedValue.byteLength + 1; // + 1 for terminating nil
+    }
+    return result;
+  }
+  
+
+
 class ProxyPassRoot extends RootContext {
 
   // VisualCodeStudio complains about u32.  u32 is declared at 
@@ -47,6 +119,7 @@ class ProxyPassRoot extends RootContext {
 class ProxyPass extends Context {
   httpStatus: i32 = 0;
   httpFailed: bool = false
+  overrideInProgress: bool = false
 
   constructor(context_id: u32, root_context:ProxyPassRoot){
     super(context_id, root_context);
@@ -57,9 +130,11 @@ class ProxyPass extends Context {
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onRequestHeaders(" + header_count.toString() + ", " + end_of_stream.toString() + ")");
     var request_headers = stream_context.headers.request.get_headers()
     for (var i = 0; i < request_headers.length; i++) {
-      var pair = request_headers[i]
+      var pair = request_headers[i];
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ":    " + String.UTF8.decode(pair.key) + ": " + String.UTF8.decode(pair.value));
     }
+
+    this.overrideInProgress = false;
 
     return super.onRequestHeaders(header_count, end_of_stream)
   }
@@ -84,12 +159,20 @@ class ProxyPass extends Context {
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ":    " + String.UTF8.decode(pair.key) + ": " + String.UTF8.decode(pair.value));
     }
 
+    if (this.overrideInProgress) {
+      // Prevent infinite recursion
+      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders(" + headerCount.toString() + ", " + end_of_stream.toString() + ") continuing in-progress body override");
+      return FilterHeadersStatusValues.Continue;
+    }
+
     // Get HTTP status
     this.httpStatus = <i32>parseInt(stream_context.headers.response.get(":status"));
     this.httpFailed = (failureStatuses.indexOf(this.httpStatus) >= 0);
 
     // TODO verify this isn't JSON according to the headers
-    if (this.httpStatus) {
+    if (this.httpFailed) {
+      this.overrideInProgress = true
+
       // let cluster = this.root_context.getConfiguration();
       // let cluster = "http://example.com/"
       let cluster = "outbound|80||example.com"
@@ -126,6 +209,8 @@ class ProxyPass extends Context {
       // callHeaders.push(new HeaderPair(String.UTF8.encode(":path"), String.UTF8.encode("/")));
       // callHeaders.push(new HeaderPair(String.UTF8.encode(":authority"), String.UTF8.encode("example.com")));
       // var cluster = "outbound|8000||httpbin.default.svc.cluster.local";
+
+      /* @@@ This is how Solo.io wants to call:
       let result = this.root_context.httpCall(cluster,
         callHeaders,
         // no need for body/trailers?
@@ -150,53 +235,57 @@ class ProxyPass extends Context {
             [], 
             // status
             GrpcStatusValues.Ok);
-            */
       });
+      */
 
+     let buffer = String.UTF8.encode(cluster);
+     let header_pairs = serializeHeaders(callHeaders);
+     let trailer_pairs = serializeHeaders([]);
+     let token = new Reference<u32>();
+     let timeout_milliseconds = 0;
+     let body = new ArrayBuffer(0)
+     let result = proxy_http_call(changetype<usize>(buffer), buffer.byteLength, changetype<usize>(header_pairs), header_pairs.byteLength, changetype<usize>(body), body.byteLength, changetype<usize>(trailer_pairs), trailer_pairs.byteLength, timeout_milliseconds, token.ptr());
+     log(LogLevelValues.warn, "@@@ ecs proxy_http_call executed with result: " + result.toString());
+ 
       if (result != WasmResultValues.Ok) {
         log(LogLevelValues.warn, "ProxyPass.onResponseHeaders() failed http call: " + result.toString());
 
-        // send_local_response(500, "internal server error", new ArrayBuffer(0), [], GrpcStatusValues.Internal);
+        var newBody = String.UTF8.encode("Error invoking both real and UI microservice.  Real failed with " + this.httpStatus.toString() + ", invocation of UI failed with " + result.toString() + "\n");
+        send_local_response(this.httpStatus, "Failed/WASM", newBody, [], GrpcStatusValues.Unknown);
+
+        log(LogLevelValues.warn, "@@@ ecs sent local response")
 
         // @@@ TODO restore? return FilterHeadersStatusValues.StopIteration;
       } else {
         log(LogLevelValues.warn, "ProxyPass.onResponseHeaders() succeeded http call: " + result.toString());
       }
+      return FilterHeadersStatusValues.StopIteration;
     }
     return FilterHeadersStatusValues.Continue;
-  }
-
-  onResponseMetadata(a: u32): FilterMetadataStatusValues {
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseMetadata(" + a.toString() + ")")
-    return FilterMetadataStatusValues.Continue;
   }
 
   onResponseBody(body_buffer_length: usize, end_of_stream: bool): FilterDataStatusValues {
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseBody(" + body_buffer_length.toString() + ", " + end_of_stream.toString() + ")")
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we saw HTTP Status " + this.httpStatus.toString())
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we failed: " + this.httpFailed.toString())
-    // TODO Send a hard coded hello world as the body
-    // send_local_response(403, "not authorized", new ArrayBuffer(0), [], GrpcStatusValues.Unknown);
-    // The C++ spec https://github.com/proxy-wasm/proxy-wasm-cpp-sdk/blob/master/proxy_wasm_enums.h defines
-    // The AssemblyScript spec defines https://github.com/solo-io/proxy-runtime/blob/master/assembly/runtime.ts
-    // The meanings are giving in https://github.com/envoyproxy/envoy/blob/master/include/envoy/http/filter.h
-    // FilterDataStatusValues.Continue,
-    // FilterDataStatusValues.StopIterationAndBuffer
-    // FilterDataStatusValues.StopIterationAndWatermark
-    // FilterDataStatusValues.StopIterationNoBuffer
-    // if (this.httpFailed) {
-    //  return FilterDataStatusValues.StopIterationNoBuffer;  
-    // }
+
+    // Calls here to send_local_response() trigger another invocation of onResponseHeaders() and
+    // onResponseBody(), and infinite recursion is possible.
+
+    // The base class just returns Continue
+    // return super.onResponseBody(body_buffer_length, end_of_stream);
+
+    // It is possible to stop, for example returning StopIterationNoBuffer, but nothing will get sent to the
+    // client unless continue_response() is called.
     return FilterDataStatusValues.Continue;
+
+    // This is the only option to not use the buffer
+    // return FilterDataStatusValues.StopIterationNoBuffer
   }
-  onResponseTrailers(s: u32): FilterTrailersStatusValues {
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseTrailers(" + s.toString() + ")")
-    return FilterTrailersStatusValues.Continue;
-  }
+
   onDone(): bool { 
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onDone()");
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we saw HTTP Status " + this.httpStatus.toString())
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we failed: " + this.httpFailed.toString())
     return super.onDone();
   }
   onDelete(): void { 
@@ -206,4 +295,3 @@ class ProxyPass extends Context {
 }
 
 registerRootContext((context_id: u32) => { return new ProxyPassRoot(context_id); }, "experiment-1.8");
-// Note: calling "log()" here causes Envoy to segfault?
