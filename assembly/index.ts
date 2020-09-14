@@ -8,96 +8,20 @@
 
 // TODO Why does Visual Studio Code object to the following line; note the directory doesn't exist.
 export * from "@solo-io/proxy-runtime/proxy"; // this exports the required functions for the proxy to interact with us.
-import { RootContext, Context, registerRootContext,
-  FilterHeadersStatusValues, FilterMetadataStatusValues, FilterDataStatusValues, FilterTrailersStatusValues, GrpcStatusValues,
-  stream_context, send_local_response,
+import { RootContext, Context, registerRootContext, 
+  FilterHeadersStatusValues, FilterDataStatusValues, GrpcStatusValues,
+  stream_context, send_local_response, continue_response,
   HeaderPair, Headers, WasmResultValues, LogLevelValues, log } from "@solo-io/proxy-runtime";
-// import { get_current_time_nanoseconds, set_tick_period_milliseconds } from "@solo-io/proxy-runtime/runtime";
-
-// TODO REMOVE: This doesn't work to tell Visual Code Studio about "u32"
-// (recommended by https://github.com/AssemblyScript/assemblyscript/issues/390 )
-/// <reference path="../node_modules/assemblyscript/index.d.ts" />
+import { get_buffer_bytes, get_status } from "@solo-io/proxy-runtime/runtime";
 
 // TODO REMOVE 418.  It is here for testing.
 var failureStatuses = [402, 403, 404, 500, 501, 502, 503, 504, 418];
-
-// TODO remove
-type char = u8;
-type ptr<T> = usize;
-type size_t = usize;
-type WasmResult = u32;
-class Reference<T> {
-  data: T;
-
-  ptr(): usize {
-    return changetype<usize>(this) + offsetof<Reference<T>>("data");
-  }
-}
-
-function pairsSize(headers: Headers): i32 {
-  let size = 4; // number of headers
-  // for in loop doesn't seem to be supported..
-  for (let i = 0; i < headers.length; i++) {
-    let header = headers[i];
-    size += 8;                   // size of key, size of value
-    size += header.key.byteLength + 1;  // null terminated key
-    size += header.value.byteLength + 1; // null terminated value
-  }
-  return size;
-}
-
-// @ts-ignore: decorator
-@external("env", "proxy_http_call")
-declare function proxy_http_call(uri_ptr: ptr<char>, uri_size: size_t, header_pairs_ptr: ptr<void>, header_pairs_size: size_t, body_ptr: ptr<char>, body_size: size_t, trailer_pairs_ptr: ptr<void>, trailer_pairs_size: size_t, timeout_milliseconds: u32, token_ptr: ptr<u32>): WasmResult;
-
-  function serializeHeaders(headers: Headers): ArrayBuffer {
-    let result = new ArrayBuffer(pairsSize(headers));
-    let sizes = Uint32Array.wrap(result, 0, 1 + 2 * headers.length);
-    sizes[0] = headers.length;
-  
-    // header sizes:
-    let index = 1;
-  
-    // for in loop doesn't seem to be supported..
-    for (let i = 0; i < headers.length; i++) {
-      let header = headers[i];
-      sizes[index] = header.key.byteLength;
-      index++;
-      sizes[index] = header.value.byteLength;
-      index++;
-    }
-  
-    let data = Uint8Array.wrap(result, sizes.byteLength);
-  
-    let currentOffset = 0;
-    // for in loop doesn't seem to be supported..
-    for (let i = 0; i < headers.length; i++) {
-      let header = headers[i];
-      // i'm sure there's a better way to copy, i just don't know what it is :/
-      let wrappedKey = Uint8Array.wrap(header.key);
-      let keyData = data.subarray(currentOffset, currentOffset + wrappedKey.byteLength);
-      for (let i = 0; i < wrappedKey.byteLength; i++) {
-        keyData[i] = wrappedKey[i];
-      }
-      currentOffset += wrappedKey.byteLength + 1; // + 1 for terminating nil
-  
-      let wrappedValue = Uint8Array.wrap(header.value);
-      let valueData = data.subarray(currentOffset, currentOffset + wrappedValue.byteLength);
-      for (let i = 0; i < wrappedValue.byteLength; i++) {
-        valueData[i] = wrappedValue[i];
-      }
-      currentOffset += wrappedValue.byteLength + 1; // + 1 for terminating nil
-    }
-    return result;
-  }
-  
-
 
 class ProxyPassRoot extends RootContext {
 
   // VisualCodeStudio complains about u32.  u32 is declared at 
   createContext(context_id: u32): Context {
-    log(LogLevelValues.warn, "ProxyPassRoot.createContext(context_id:" + this.context_id.toString() + ")");
+      (LogLevelValues.warn, "ProxyPassRoot.createContext(context_id:" + this.context_id.toString() + ")");
     return new ProxyPass(context_id, this);
   }
 
@@ -106,6 +30,7 @@ class ProxyPassRoot extends RootContext {
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPassRoot.onStart(vm_configuration_size:" + vm_configuration_size.toString() + ")");
     return super.onStart(vm_configuration_size);
   }
+
   onDone(): bool { 
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPassRoot.onDone()");
     return super.onDone();
@@ -118,8 +43,11 @@ class ProxyPassRoot extends RootContext {
 
 class ProxyPass extends Context {
   httpStatus: i32 = 0;
-  httpFailed: bool = false
-  overrideInProgress: bool = false
+  httpFailed: bool = false;
+  overrideInProgress: bool = false;
+  originalRequestHeaders: Headers = [];
+  copiedRequestHeaders: Headers = [];
+
 
   constructor(context_id: u32, root_context:ProxyPassRoot){
     super(context_id, root_context);
@@ -128,9 +56,13 @@ class ProxyPass extends Context {
   // onRequestHeaders sees the regular headers plus :authority, :path, and :method
   onRequestHeaders(header_count: u32, end_of_stream: bool): FilterHeadersStatusValues {
     log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onRequestHeaders(" + header_count.toString() + ", " + end_of_stream.toString() + ")");
+
+    this.originalRequestHeaders = stream_context.headers.request.get_headers()
+    this.copiedRequestHeaders = new Array<HeaderPair>(stream_context.headers.request.get_headers().length)
     var request_headers = stream_context.headers.request.get_headers()
     for (var i = 0; i < request_headers.length; i++) {
       var pair = request_headers[i];
+      this.copiedRequestHeaders[i] = request_headers[i];
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ":    " + String.UTF8.decode(pair.key) + ": " + String.UTF8.decode(pair.value));
     }
 
@@ -169,48 +101,24 @@ class ProxyPass extends Context {
     this.httpStatus = <i32>parseInt(stream_context.headers.response.get(":status"));
     this.httpFailed = (failureStatuses.indexOf(this.httpStatus) >= 0);
 
-    // TODO verify this isn't JSON according to the headers
     if (this.httpFailed) {
       this.overrideInProgress = true
 
+      // TODO verify this isn't JSON according to the headers
+
       // let cluster = this.root_context.getConfiguration();
-      // let cluster = "http://example.com/"
       let cluster = "outbound|80||example.com"
+      // var cluster = "outbound|8000||httpbin.default.svc.cluster.local";
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() will request replacement body from " + cluster);
 
-      /*
       let callHeaders: Headers = [];
       log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created callHeaders");
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":authority"), String.UTF8.encode("example.com")));
-      var abPath = String.UTF8.encode(":path");
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created path ArrayBuffer");
-      var abSlash = String.UTF8.encode("/");
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created slash ArrayBuffer");
-      var hpPath: HeaderPair = new HeaderPair(abPath, abSlash);
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created headerPair");
-      callHeaders.push(hpPath);
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() pushed headerPair");
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":path"), String.UTF8.encode("/")));
-      var abMethod = String.UTF8.encode(":method");
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created method ArrayBuffer");
-      var abGet = String.UTF8.encode("GET");
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created get ArrayBuffer");
-      var hpMethod: HeaderPair = new HeaderPair(abMethod, abGet);
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() created headerPair");
-      callHeaders.push(hpMethod);
-      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseHeaders() pushed headerPair");
-      */
 
-      let callHeaders = stream_context.headers.request.get_headers()
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":method"), String.UTF8.encode("GET")));
-      // TODO httpCall is not returning, it is logging "critical	envoy wasm	wasm log:  at: ~lib/rt/tlsf.ts(580:3)"
-      // which is a checkUsedBlock() assert that a memory block is valid, if I use 
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":method"), String.UTF8.encode("GET")));
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":path"), String.UTF8.encode("/")));
-      // callHeaders.push(new HeaderPair(String.UTF8.encode(":authority"), String.UTF8.encode("example.com")));
-      // var cluster = "outbound|8000||httpbin.default.svc.cluster.local";
+      // let callHeaders = stream_context.headers.request.get_headers()
+      callHeaders.push(new HeaderPair(String.UTF8.encode(":method"), String.UTF8.encode("GET")));
+      callHeaders.push(new HeaderPair(String.UTF8.encode(":path"), String.UTF8.encode("/")));
+      callHeaders.push(new HeaderPair(String.UTF8.encode(":authority"), String.UTF8.encode("example.com")));
 
-      /* @@@ This is how Solo.io wants to call:
       let result = this.root_context.httpCall(cluster,
         callHeaders,
         // no need for body/trailers?
@@ -220,34 +128,62 @@ class ProxyPass extends Context {
         // ourselves as callback
         this,
         // http callback: called when there's a response. if the request failed, headers will be 0
-        (origin_context: Context, headers: u32, body_size: usize, trailers: u32) => {
+        (origin_context: Context, headerCount: u32, body_size: usize, trailerCount: u32) => {
           log(LogLevelValues.warn, "ProxyPass.onResponseHeaders() in callback!!!");
-          /*
-          let context = origin_context as ProxyPass;
-          let allow = false;
 
+          let context = origin_context as ProxyPass;
+
+          log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + ": ProxyPass httpGet callback(..., " + 
+            headerCount.toString() + ", " +
+            body_size.toString() + ", " +
+            trailerCount.toString() + ")");
+
+          let status = "<none>"
+          if (headerCount > 0) {
+            status = stream_context.headers.http_callback.get(":status");
+          }
+
+          var callback_headers = stream_context.headers.http_callback.get_headers()
+          for (var i = 0; i < callback_headers.length; i++) {
+            var pair = callback_headers[i]
+            log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + ":    " + String.UTF8.decode(pair.key) + ": " + String.UTF8.decode(pair.value));
+          }
+      
+          // TODO this isn't working.  I wanted the body, this shows 0 and the empty string
+          var swd = get_status();
+          log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + ": ProxyPass httpGet callback() get_status() got status:\n" + swd.status.toString());
+          var body = String.UTF8.decode(swd.data)
+          log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + ": ProxyPass httpGet callback() get_status() got body:\n" + body);
+
+          // let WasmBufferType_HttpRequestBody = 0
+          let WasmBufferType_HttpCallResponseBody = 4
+          var abbody = get_buffer_bytes(WasmBufferType_HttpCallResponseBody, 0, <u32>body_size)
+          log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + "   : ProxyPass httpGet callback() past get_buffer_bytes invocation")
+          var body2 = String.UTF8.decode(abbody)
+          log(LogLevelValues.warn, "context id: " + origin_context.context_id.toString() + ": ProxyPass httpGet callback() get_buffer_bytes() got body:\n" + body2);
+
+          context.overrideInProgress = false;
+          // @@@ TODO real body.  See the note on onResponseBody() about the C++ example doing it.
+          var newBody = String.UTF8.encode("Call yielded status " + status + " and a buffer of " + body_size.toString() + " bytes that I don't know how to extract.\n");
+          log(LogLevelValues.warn, "@@@ ecs will now send local response 'from' example.com")
           send_local_response(context.httpStatus, 
             // details
             "", 
-            // body
-            new ArrayBuffer(0), 
+            newBody, 
             // Additional headers
             [], 
             // status
             GrpcStatusValues.Ok);
-      });
-      */
 
-     let buffer = String.UTF8.encode(cluster);
-     let header_pairs = serializeHeaders(callHeaders);
-     let trailer_pairs = serializeHeaders([]);
-     let token = new Reference<u32>();
-     let timeout_milliseconds = 0;
-     let body = new ArrayBuffer(0)
-     let result = proxy_http_call(changetype<usize>(buffer), buffer.byteLength, changetype<usize>(header_pairs), header_pairs.byteLength, changetype<usize>(body), body.byteLength, changetype<usize>(trailer_pairs), trailer_pairs.byteLength, timeout_milliseconds, token.ptr());
-     log(LogLevelValues.warn, "@@@ ecs proxy_http_call executed with result: " + result.toString());
- 
+            // When I didn't call this, Envoy crashed with
+            // envoy assert	assert failure: !state_.codec_saw_local_complete_.
+            log(LogLevelValues.warn, "@@@ ecs sent local response; will now attempt to continue")
+            continue_response()
+            log(LogLevelValues.warn, "@@@ ecs continued response")
+      });
+
       if (result != WasmResultValues.Ok) {
+        this.overrideInProgress = false;
         log(LogLevelValues.warn, "ProxyPass.onResponseHeaders() failed http call: " + result.toString());
 
         var newBody = String.UTF8.encode("Error invoking both real and UI microservice.  Real failed with " + this.httpStatus.toString() + ", invocation of UI failed with " + result.toString() + "\n");
@@ -260,14 +196,34 @@ class ProxyPass extends Context {
         log(LogLevelValues.warn, "ProxyPass.onResponseHeaders() succeeded http call: " + result.toString());
       }
       return FilterHeadersStatusValues.StopIteration;
+
     }
     return FilterHeadersStatusValues.Continue;
   }
 
   onResponseBody(body_buffer_length: usize, end_of_stream: bool): FilterDataStatusValues {
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseBody(" + body_buffer_length.toString() + ", " + end_of_stream.toString() + ")")
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we saw HTTP Status " + this.httpStatus.toString())
-    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we failed: " + this.httpFailed.toString())
+    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + ": ProxyPass.onResponseBody(" + body_buffer_length.toString() + ", " + end_of_stream.toString() + ")");
+    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we saw HTTP Status " + this.httpStatus.toString());
+    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : when the headers went by, we failed: " + this.httpFailed.toString());
+    if (!this.overrideInProgress) {
+      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : an override is in progress");
+    } else {
+      log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : no body override now");
+    }
+
+    // To see the body itself, there is a C++ example at
+    // envoy/envoy-wasm/examples/wasm/envoy_filter_http_wasm_example.cc
+    // which does 
+    // auto body = getBufferBytes(WasmBufferType::HttpRequestBody, 0, body_buffer_length);
+    // LOG_ERROR(std::string("onRequestBody ") + std::string(body->view()));
+    // The definition of WasmBufferType::HttpRequestBody is in
+    // https://github.com/proxy-wasm/proxy-wasm-cpp-sdk/blob/master/proxy_wasm_common.h
+    /*
+    let WasmBufferType_HttpRequestBody = 0
+    var body = get_buffer_bytes(WasmBufferType_HttpRequestBody, 0, <u32>body_buffer_length)
+    log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : past get_buffer_bytes invocation")
+    // log(LogLevelValues.warn, "context id: " + this.context_id.toString() + "   : has body " + String.UTF8.decode(body))
+*/
 
     // Calls here to send_local_response() trigger another invocation of onResponseHeaders() and
     // onResponseBody(), and infinite recursion is possible.
@@ -277,10 +233,14 @@ class ProxyPass extends Context {
 
     // It is possible to stop, for example returning StopIterationNoBuffer, but nothing will get sent to the
     // client unless continue_response() is called.
-    return FilterDataStatusValues.Continue;
 
+    if (!this.overrideInProgress) {
+      return FilterDataStatusValues.Continue;
+    }
+
+    // Wait until the override is done before using the buffer.
     // This is the only option to not use the buffer
-    // return FilterDataStatusValues.StopIterationNoBuffer
+    return FilterDataStatusValues.StopIterationNoBuffer
   }
 
   onDone(): bool { 
